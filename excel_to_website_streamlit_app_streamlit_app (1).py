@@ -1,38 +1,36 @@
 """
-Streamlit app: builds a small web UI from an uploaded Excel file.
+Interactive Streamlit app that reads your uploaded Excel workbook and provides a dynamic form
+so you can input data and immediately get results.
 
-File used (from your upload): /mnt/data/swet slab.xlsx
+Features:
+- Loads Excel from repo-relative path `swet slab.xlsx` or fallback `/mnt/data/swet slab.xlsx` (your uploaded file).
+- Lets you choose a sheet; auto-generates an input form from the sheet's columns (numeric, text, bool).
+- On submit: shows the new input as a row, finds the top-3 closest existing rows (by numeric columns),
+  displays them, shows updated summary statistics, and allows downloading the input + matched rows.
+- Includes a file uploader fallback if the workbook isn't present in the repo.
 
-How to run:
-1. (Optional) create a venv: python -m venv venv && source venv/bin/activate
-2. Install requirements: pip install streamlit pandas openpyxl
-3. Run: streamlit run streamlit_app.py
-
-This single-file app reads the Excel workbook, lists its sheets, and for each sheet provides:
-- Data preview and full table download
-- Column filtering and simple queries
-- Summary stats for numeric columns
-- Simple plotting (line, bar, area) via streamlit's chart helpers
-
-Modify the code to add custom pages, styling, or to export to a production-ready framework (Flask/React/Django) if you want a multi-page site.
-
-Note: The app directly reads the path /mnt/data/swet slab.xlsx which should already exist in the environment (from your uploaded file).
+Run:
+1. pip install streamlit pandas scikit-learn openpyxl
+2. streamlit run interactive_app.py
 
 """
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
-from pathlib import Path
+import os
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import pairwise_distances
 
-EXCEL_PATH = "swet slab.xlsx"
+# Try relative path first, then fallback to the uploaded path you used earlier
+DEFAULT_FILENAMES = ["swet slab.xlsx", "/mnt/data/swet slab.xlsx"]
 
+st.set_page_config(page_title="Interactive Excel -> Results", layout="wide")
+st.title("Interactive Excel-powered website")
+st.markdown("Enter values in the form and get instant results (closest matches, summary stats, downloads).")
 
-st.set_page_config(page_title="Excel → Website", layout="wide")
-st.title("Excel → Website: interactive viewer")
-st.markdown("Upload / preview / explore the workbook stored at: `{}`".format(EXCEL_PATH))
-
-# Load workbook
+# Helper: load workbook
 @st.cache_data
 def load_workbook(path):
     xl = pd.ExcelFile(path)
@@ -40,95 +38,142 @@ def load_workbook(path):
     dfs = {s: xl.parse(s) for s in sheets}
     return dfs
 
-try:
-    dfs = load_workbook(EXCEL_PATH)
-except Exception as e:
-    st.error(f"Failed to load workbook at {EXCEL_PATH}: {e}")
+# Choose how to load workbook
+excel_path = None
+for p in DEFAULT_FILENAMES:
+    if os.path.exists(p):
+        excel_path = p
+        break
+
+if excel_path is None:
+    st.warning("Workbook not found in repo. Upload it now (or place `swet slab.xlsx` in the repo root).")
+    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+    if uploaded:
+        excel_path = uploaded
+
+if excel_path is None:
+    st.info("No workbook available yet. Upload `swet slab.xlsx` or push it to your repo and refresh.")
     st.stop()
 
+# Try loading
+try:
+    dfs = load_workbook(excel_path)
+except Exception as e:
+    st.error(f"Failed to load workbook: {e}")
+    st.stop()
+
+# Choose sheet
 sheet = st.sidebar.selectbox("Choose sheet", list(dfs.keys()))
-df = dfs[sheet]
+df = dfs[sheet].copy()
+
+st.sidebar.write(f"Rows: {df.shape[0]}, Columns: {df.shape[1]}")
+
+# Identify column types
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+bool_cols = df.select_dtypes(include=[bool]).columns.tolist()
+object_cols = [c for c in df.columns if c not in numeric_cols + bool_cols]
 
 st.header(f"Sheet: {sheet}")
+with st.expander("Preview data (first 5 rows)"):
+    st.dataframe(df.head())
 
-# Basic info
-c1, c2, c3 = st.columns([1,1,1])
-with c1:
-    st.write("**Rows**")
-    st.write(df.shape[0])
-with c2:
-    st.write("**Columns**")
-    st.write(df.shape[1])
-with c3:
-    st.write("**Preview**")
-    st.write(df.head(3))
+st.subheader("Input form")
+st.markdown("Fill the form below and press Submit. The app will show nearest rows (based on numeric columns) and updated summaries.")
 
-st.subheader("Data table")
-# Column selection
-cols = st.multiselect("Select columns to display", options=df.columns.tolist(), default=df.columns.tolist())
-filtered = df[cols]
+# Build dynamic form
+with st.form(key="input_form"):
+    inputs = {}
+    # Numeric inputs
+    for c in numeric_cols:
+        min_v = float(np.nanmin(df[c]) if not df[c].isna().all() else 0)
+        max_v = float(np.nanmax(df[c]) if not df[c].isna().all() else 100)
+        mean_v = float(np.nanmean(df[c]) if not df[c].isna().all() else 0)
+        inputs[c] = st.number_input(label=f"{c} (numeric)", value=mean_v, format="%.5f")
+    # Boolean inputs
+    for c in bool_cols:
+        default = bool(df[c].mode()[0]) if not df[c].isna().all() else False
+        inputs[c] = st.checkbox(label=f"{c} (bool)", value=default)
+    # Text/object inputs
+    for c in object_cols:
+        sample = str(df[c].dropna().astype(str).iloc[0]) if not df[c].dropna().empty else ""
+        inputs[c] = st.text_input(label=f"{c} (text)", value=sample)
 
-# Filtering: allow simple equals filter on up to 3 columns
-st.subheader("Filters")
-filter_cols = st.multiselect("Pick columns to filter (optional)", options=df.columns.tolist())
-query_df = filtered.copy()
-for fc in filter_cols:
-    unique_vals = query_df[fc].dropna().unique()
-    if query_df[fc].dtype == 'object' or len(unique_vals) <= 30:
-        sel = st.multiselect(f"Values for {fc}", options=sorted(map(str, unique_vals)), key=f"f_{fc}")
-        if sel:
-            query_df = query_df[query_df[fc].astype(str).isin(sel)]
+    submitted = st.form_submit_button("Submit")
+
+if submitted:
+    st.success("Input received — processing...")
+
+    # Build input row as DataFrame with same columns and dtypes
+    input_row = pd.DataFrame(columns=df.columns)
+    # Fill numeric
+    for c in numeric_cols:
+        input_row.loc[0, c] = inputs[c]
+    for c in bool_cols:
+        input_row.loc[0, c] = inputs[c]
+    for c in object_cols:
+        input_row.loc[0, c] = inputs[c]
+
+    # Cast numeric columns
+    for c in numeric_cols:
+        input_row[c] = pd.to_numeric(input_row[c], errors='coerce')
+
+    st.subheader("Your input (as row)")
+    st.dataframe(input_row)
+
+    # If there are numeric columns, find nearest neighbors
+    if numeric_cols:
+        st.subheader("Top 3 closest rows (by numeric columns)")
+        # Prepare data for distance: standardize
+        X_existing = df[numeric_cols].fillna(df[numeric_cols].mean())
+        X_input = input_row[numeric_cols].fillna(X_existing.mean())
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X_existing)
+        Xi = scaler.transform(X_input)
+        dists = pairwise_distances(Xs, Xi, metric='euclidean').reshape(-1)
+        closest_idx = np.argsort(dists)[:3]
+        matches = df.iloc[closest_idx].copy()
+        matches['distance'] = dists[closest_idx]
+        st.dataframe(matches)
+
+        # Show a simple comparison chart for the first numeric column
+        first_num = numeric_cols[0]
+        st.line_chart(pd.concat([X_existing.reset_index(drop=True)[[first_num]].assign(type='existing'),
+                                 pd.DataFrame({first_num: X_input.iloc[0].values}).assign(type='input')], ignore_index=True)[first_num])
     else:
-        min_v = float(query_df[fc].min())
-        max_v = float(query_df[fc].max())
-        r = st.slider(f"Range for {fc}", min_value=min_v, max_value=max_v, value=(min_v, max_v), key=f"r_{fc}")
-        query_df = query_df[(query_df[fc] >= r[0]) & (query_df[fc] <= r[1])]
+        st.info("No numeric columns to compute closest rows. Showing exact text matches instead.")
+        # Try to find rows that match text columns
+        if object_cols:
+            mask = pd.Series([True]*len(df))
+            for c in object_cols:
+                val = str(inputs[c]).strip()
+                if val:
+                    mask = mask & df[c].astype(str).str.contains(val, case=False, na=False)
+            res = df[mask]
+            st.write(f"Found {len(res)} matching rows")
+            st.dataframe(res.head(10))
 
-st.write(f"Showing {query_df.shape[0]} rows")
-st.dataframe(query_df, use_container_width=True)
+    # Append input to top of results and offer download
+    out_df = pd.concat([input_row, df], ignore_index=True)
+    st.subheader("Updated summary (numeric)")
+    if not out_df.select_dtypes(include=[np.number]).empty:
+        st.dataframe(out_df.select_dtypes(include=[np.number]).describe().T)
 
-# Download filtered data
-@st.cache_data
-def to_excel_bytes(df_in):
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df_in.to_excel(writer, index=False, sheet_name='export')
-    return buffer.getvalue()
+    # Prepare download
+    def to_excel_bytes(df_in):
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            df_in.to_excel(writer, index=False, sheet_name='results')
+        return buffer.getvalue()
 
-if st.download_button("Download filtered data as Excel", data=to_excel_bytes(query_df), file_name=f"{sheet}_filtered.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"):
-    st.success("Download prepared")
+    download_bytes = to_excel_bytes(pd.concat([input_row, matches] if numeric_cols else out_df.head(10)))
+    st.download_button("Download input + matches as Excel", data=download_bytes, file_name="input_and_matches.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Summary stats
-st.subheader("Summary statistics (numeric)")
-num = query_df.select_dtypes(include='number')
-if not num.empty:
-    st.dataframe(num.describe().T)
-else:
-    st.info("No numeric columns on this sheet to summarize")
-
-# Simple plotting
-st.subheader("Quick plots")
-plot_cols = st.multiselect("Choose up to 3 numeric columns to plot", options=num.columns.tolist(), max_selections=3)
-if plot_cols:
-    plot_type = st.selectbox("Plot type", ['line','area','bar'])
-    try:
-        if plot_type == 'line':
-            st.line_chart(query_df[plot_cols])
-        elif plot_type == 'area':
-            st.area_chart(query_df[plot_cols])
-        else:
-            st.bar_chart(query_df[plot_cols])
-    except Exception as e:
-        st.error(f"Could not draw chart: {e}")
-
-# Show whole workbook navigation
+# Extra utilities
 st.sidebar.markdown("---")
-if st.sidebar.button("List sheets & row counts"):
-    for sname, sdata in dfs.items():
-        st.sidebar.write(f"{sname}: {sdata.shape[0]} rows × {sdata.shape[1]} cols")
+if st.sidebar.checkbox("Show full sheet data"):
+    st.header("Full sheet data")
+    st.dataframe(df, use_container_width=True)
 
-# Footer / next steps
-st.markdown("---")
-st.markdown("**Next steps / customization ideas**:\n\n- Turn this into a Flask or React front-end if you need custom styling and auth.\n- Add server-side processing if the Excel is large.\n- Add charts and dashboards per sheet for domain-specific views.")
+st.sidebar.markdown("\nDeploy notes:\n- Add requirements.txt with: streamlit, pandas, scikit-learn, openpyxl\n- Place the Excel file `swet slab.xlsx` in repo root or upload it via the uploader in the app.")
 
-st.caption("App generated from your uploaded Excel file. Ask me to convert this into a Flask app, a multi-page React + API site, or deploy it to Streamlit Cloud / Heroku.")
+st.caption("Interactive app created for you. Ask me to convert this to Flask + React or to tweak specific behavior (e.g., change matching method, prediction model, or form layout).")
