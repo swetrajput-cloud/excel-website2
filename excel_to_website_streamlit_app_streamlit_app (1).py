@@ -25,7 +25,8 @@ import pandas as pd
 import io
 from pathlib import Path
 
-EXCEL_PATH = "/mnt/data/swet slab.xlsx"
+EXCEL_PATH = "swet slab.xlsx"
+
 
 st.set_page_config(page_title="Excel → Website", layout="wide")
 st.title("Excel → Website: interactive viewer")
